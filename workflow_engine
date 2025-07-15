@@ -1,0 +1,153 @@
+# workflow_engine.py - Advanced workflow execution engine
+import asyncio
+import json
+import traceback
+from typing import Dict, List, Any, Optional, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+import networkx as nx
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ExecutionStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+@dataclass
+class BlockResult:
+    status: ExecutionStatus
+    outputs: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    execution_time: float = 0.0
+    logs: List[str] = field(default_factory=list)
+
+@dataclass
+class WorkflowContext:
+    """Context passed between blocks during execution"""
+    global_variables: Dict[str, Any] = field(default_factory=dict)
+    execution_id: str = ""
+    user_id: str = ""
+    
+class AdvancedWorkflowEngine:
+    def __init__(self, block_executors: Dict[str, Callable] = None):
+        self.block_executors = block_executors or {}
+        self.middleware = []
+        self.hooks = {
+            'before_execution': [],
+            'after_execution': [],
+            'before_block': [],
+            'after_block': [],
+            'on_error': []
+        }
+    
+    def register_executor(self, block_type: str, executor: Callable):
+        """Register a block executor function"""
+        self.block_executors[block_type] = executor
+    
+    def add_middleware(self, middleware: Callable):
+        """Add middleware function to be called before each block execution"""
+        self.middleware.append(middleware)
+    
+    def add_hook(self, event: str, callback: Callable):
+        """Add event hook"""
+        if event in self.hooks:
+            self.hooks[event].append(callback)
+    
+    async def execute_workflow(
+        self, 
+        blocks: List[Dict[str, Any]], 
+        connections: List[Dict[str, str]], 
+        context: WorkflowContext = None
+    ) -> Dict[str, BlockResult]:
+        """Execute a complete workflow with advanced features"""
+        
+        if context is None:
+            context = WorkflowContext()
+        
+        # Build execution graph
+        graph = self._build_execution_graph(blocks, connections)
+        
+        # Validate workflow
+        validation_errors = self._validate_workflow(graph, blocks)
+        if validation_errors:
+            raise ValueError(f"Workflow validation failed: {validation_errors}")
+        
+        # Execute hooks
+        for hook in self.hooks['before_execution']:
+            await hook(context, blocks, connections)
+        
+        results = {}
+        execution_order = list(nx.topological_sort(graph))
+        
+        try:
+            # Execute blocks in topological order
+            for block_id in execution_order:
+                block_data = next(b for b in blocks if b.get('id') == block_id)
+                
+                # Check if block should be skipped based on conditions
+                if await self._should_skip_block(block_data, results, context):
+                    results[block_id] = BlockResult(status=ExecutionStatus.SKIPPED)
+                    continue
+                
+                # Execute middleware
+                for middleware in self.middleware:
+                    await middleware(block_data, context)
+                
+                # Execute before_block hooks
+                for hook in self.hooks['before_block']:
+                    await hook(block_data, context)
+                
+                # Execute the block
+                start_time = datetime.now()
+                try:
+                    result = await self._execute_block(block_data, results, context, graph)
+                    execution_time = (datetime.now() - start_time).total_seconds()
+                    result.execution_time = execution_time
+                    results[block_id] = result
+                    
+                    # Execute after_block hooks
+                    for hook in self.hooks['after_block']:
+                        await hook(block_data, result, context)
+                        
+                except Exception as e:
+                    error_msg = f"Block {block_id} failed: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    
+                    execution_time = (datetime.now() - start_time).total_seconds()
+                    results[block_id] = BlockResult(
+                        status=ExecutionStatus.FAILED,
+                        error=error_msg,
+                        execution_time=execution_time,
+                        logs=[traceback.format_exc()]
+                    )
+                    
+                    # Execute error hooks
+                    for hook in self.hooks['on_error']:
+                        await hook(block_data, e, context)
+                    
+                    # Check if workflow should continue after error
+                    if not block_data.get('config', {}).get('continue_on_error', False):
+                        break
+            
+            # Execute after_execution hooks
+            for hook in self.hooks['after_execution']:
+                await hook(context, results)
+                
+            return results
+            
+        except Exception as e:
+            logger.error(f"Workflow execution failed: {str(e)}", exc_info=True)
+            raise
+    
+    def _build_execution_graph(self, blocks: List[Dict], connections: List[Dict]) -> nx.DiGraph:
+        """Build networkx graph from blocks and connections"""
+        graph = nx.DiGraph()
+        
+        # Add nodes
+        for block in blocks:
+            block_id = block.get('id') or block.get('config', {}).
