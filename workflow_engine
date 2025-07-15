@@ -150,4 +150,618 @@ class AdvancedWorkflowEngine:
         
         # Add nodes
         for block in blocks:
-            block_id = block.get('id') or block.get('config', {}).
+            block_id = block.get('id') or block.get('config', {}).get('id')
+            if block_id:
+                graph.add_node(block_id, block=block)
+        
+        # Add edges
+        for connection in connections:
+            if 'from' in connection and 'to' in connection:
+                graph.add_edge(connection['from'], connection['to'])
+        
+        return graph
+    
+    def _validate_workflow(self, graph: nx.DiGraph, blocks: List[Dict]) -> List[str]:
+        """Validate workflow structure and configuration"""
+        errors = []
+        
+        # Check for cycles
+        if not nx.is_directed_acyclic_graph(graph):
+            errors.append("Workflow contains cycles")
+        
+        # Check for orphaned blocks
+        for block in blocks:
+            block_id = block.get('id')
+            if block_id and block_id not in graph.nodes:
+                errors.append(f"Block {block_id} is not connected")
+        
+        # Check for missing executors
+        for block in blocks:
+            block_type = block.get('type')
+            if block_type and block_type not in self.block_executors:
+                errors.append(f"No executor found for block type: {block_type}")
+        
+        return errors
+    
+    async def _should_skip_block(self, block: Dict, results: Dict[str, BlockResult], context: WorkflowContext) -> bool:
+        """Determine if a block should be skipped based on conditions"""
+        conditions = block.get('config', {}).get('conditions', [])
+        
+        for condition in conditions:
+            condition_type = condition.get('type')
+            
+            if condition_type == 'previous_block_status':
+                target_status = condition.get('status')
+                target_block = condition.get('block_id')
+                
+                if target_block in results:
+                    if results[target_block].status.value != target_status:
+                        return True
+            
+            elif condition_type == 'variable_value':
+                var_name = condition.get('variable')
+                expected_value = condition.get('value')
+                operator = condition.get('operator', 'equals')
+                
+                actual_value = context.global_variables.get(var_name)
+                
+                if operator == 'equals' and actual_value != expected_value:
+                    return True
+                elif operator == 'not_equals' and actual_value == expected_value:
+                    return True
+                elif operator == 'greater_than' and not (actual_value and actual_value > expected_value):
+                    return True
+                elif operator == 'less_than' and not (actual_value and actual_value < expected_value):
+                    return True
+        
+        return False
+    
+    async def _execute_block(self, block: Dict, results: Dict[str, BlockResult], context: WorkflowContext, graph: nx.DiGraph) -> BlockResult:
+        """Execute a single block with error handling and logging"""
+        block_id = block.get('id')
+        block_type = block.get('type')
+        
+        # Gather inputs from predecessor blocks
+        inputs = {}
+        for pred_id in graph.predecessors(block_id):
+            if pred_id in results and results[pred_id].status == ExecutionStatus.COMPLETED:
+                inputs.update(results[pred_id].outputs)
+        
+        # Add global variables to inputs
+        inputs.update(context.global_variables)
+        
+        # Get the executor
+        executor = self.block_executors.get(block_type)
+        if not executor:
+            raise ValueError(f"No executor found for block type: {block_type}")
+        
+        # Execute the block
+        try:
+            result_data = await executor(block, inputs, context)
+            
+            # Update global variables if block outputs any
+            if isinstance(result_data, dict) and 'global_variables' in result_data:
+                context.global_variables.update(result_data['global_variables'])
+                del result_data['global_variables']
+            
+            return BlockResult(
+                status=ExecutionStatus.COMPLETED,
+                outputs=result_data or {},
+                logs=[f"Block {block_id} executed successfully"]
+            )
+            
+        except Exception as e:
+            raise e
+
+# block_executors.py - Extended block executors with more functionality
+import aiohttp
+import asyncio
+import json
+import re
+import math
+from typing import Dict, Any
+import sqlite3
+import tempfile
+import os
+
+class ExtendedBlockExecutors:
+    def __init__(self, ollama_base_url: str = "http://localhost:11434"):
+        self.ollama_base_url = ollama_base_url
+    
+    async def execute_input_block(self, block: Dict, inputs: Dict, context: WorkflowContext) -> Dict[str, Any]:
+        """Enhanced input block with variable substitution"""
+        text = block.get('config', {}).get('text', '')
+        
+        # Variable substitution
+        for var_name, var_value in context.global_variables.items():
+            text = text.replace(f'{{{var_name}}}', str(var_value))
+        
+        return {"output": text}
+    
+    async def execute_llm_block(self, block: Dict, inputs: Dict, context: WorkflowContext) -> Dict[str, Any]:
+        """Enhanced LLM block with conversation memory and streaming"""
+        config = block.get('config', {})
+        model = config.get('model', 'llama2')
+        prompt_template = config.get('prompt', '{input}')
+        temperature = config.get('temperature', 0.7)
+        max_tokens = config.get('max_tokens', 2000)
+        system_prompt = config.get('system_prompt', '')
+        use_memory = config.get('use_memory', False)
+        
+        # Build prompt with inputs
+        prompt = prompt_template.format(**inputs)
+        
+        # Add conversation memory if enabled
+        if use_memory and hasattr(context, 'conversation_history'):
+            conversation_history = getattr(context, 'conversation_history', [])
+            prompt = self._build_conversation_prompt(conversation_history, prompt, system_prompt)
+        
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "temperature": temperature,
+                "stream": False
+            }
+            
+            if system_prompt:
+                payload["system"] = system_prompt
+            
+            async with session.post(f"{self.ollama_base_url}/api/generate", json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    output_text = result.get("response", "")
+                    
+                    # Store in conversation memory if enabled
+                    if use_memory:
+                        if not hasattr(context, 'conversation_history'):
+                            context.conversation_history = []
+                        context.conversation_history.append({
+                            "user": prompt,
+                            "assistant": output_text,
+                            "timestamp": datetime.now().isoformat()
+                        })
+                    
+                    return {
+                        "output": output_text,
+                        "model_info": {
+                            "model": model,
+                            "temperature": temperature,
+                            "prompt_length": len(prompt)
+                        }
+                    }
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"Ollama API error: {error_text}")
+    
+    async def execute_transform_block(self, block: Dict, inputs: Dict, context: WorkflowContext) -> Dict[str, Any]:
+        """Enhanced transform block with regex and advanced text operations"""
+        config = block.get('config', {})
+        transform_type = config.get('type', 'uppercase')
+        input_text = str(inputs.get('input', ''))
+        
+        if transform_type == 'uppercase':
+            result = input_text.upper()
+        elif transform_type == 'lowercase':
+            result = input_text.lower()
+        elif transform_type == 'title_case':
+            result = input_text.title()
+        elif transform_type == 'trim':
+            result = input_text.strip()
+        elif transform_type == 'reverse':
+            result = input_text[::-1]
+        elif transform_type == 'remove_whitespace':
+            result = re.sub(r'\s+', ' ', input_text).strip()
+        elif transform_type == 'extract_emails':
+            email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+            result = re.findall(email_pattern, input_text)
+        elif transform_type == 'extract_urls':
+            url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+            result = re.findall(url_pattern, input_text)
+        elif transform_type == 'word_count':
+            result = len(input_text.split())
+        elif transform_type == 'char_count':
+            result = len(input_text)
+        elif transform_type == 'custom_regex':
+            pattern = config.get('regex_pattern', '')
+            replacement = config.get('replacement', '')
+            if pattern:
+                result = re.sub(pattern, replacement, input_text)
+            else:
+                result = input_text
+        else:
+            result = input_text
+        
+        return {"output": result}
+    
+    async def execute_conditional_block(self, block: Dict, inputs: Dict, context: WorkflowContext) -> Dict[str, Any]:
+        """Enhanced conditional block with multiple condition types"""
+        config = block.get('config', {})
+        conditions = config.get('conditions', [])
+        logic_operator = config.get('logic_operator', 'AND')  # AND, OR
+        
+        results = []
+        
+        for condition in conditions:
+            condition_type = condition.get('type')
+            
+            if condition_type == 'text_contains':
+                text = str(inputs.get('input', ''))
+                search_term = condition.get('value', '')
+                case_sensitive = condition.get('case_sensitive', False)
+                
+                if not case_sensitive:
+                    text = text.lower()
+                    search_term = search_term.lower()
+                
+                results.append(search_term in text)
+            
+            elif condition_type == 'number_comparison':
+                value = float(inputs.get('input', 0))
+                comparison_value = float(condition.get('value', 0))
+                operator = condition.get('operator', 'equals')
+                
+                if operator == 'equals':
+                    results.append(value == comparison_value)
+                elif operator == 'greater_than':
+                    results.append(value > comparison_value)
+                elif operator == 'less_than':
+                    results.append(value < comparison_value)
+                elif operator == 'greater_equal':
+                    results.append(value >= comparison_value)
+                elif operator == 'less_equal':
+                    results.append(value <= comparison_value)
+                elif operator == 'not_equals':
+                    results.append(value != comparison_value)
+            
+            elif condition_type == 'regex_match':
+                text = str(inputs.get('input', ''))
+                pattern = condition.get('pattern', '')
+                results.append(bool(re.search(pattern, text)))
+            
+            elif condition_type == 'length_check':
+                text = str(inputs.get('input', ''))
+                min_length = condition.get('min_length', 0)
+                max_length = condition.get('max_length', float('inf'))
+                results.append(min_length <= len(text) <= max_length)
+        
+        # Apply logic operator
+        if logic_operator == 'AND':
+            final_result = all(results)
+        elif logic_operator == 'OR':
+            final_result = any(results)
+        else:
+            final_result = any(results)
+        
+        return {
+            "output": final_result,
+            "condition_results": results,
+            "matched_path": "true" if final_result else "false"
+        }
+    
+    async def execute_loop_block(self, block: Dict, inputs: Dict, context: WorkflowContext) -> Dict[str, Any]:
+        """Enhanced loop block with different iteration types"""
+        config = block.get('config', {})
+        loop_type = config.get('type', 'count')
+        
+        results = []
+        
+        if loop_type == 'count':
+            iterations = int(config.get('iterations', 1))
+            input_value = inputs.get('input', '')
+            
+            for i in range(iterations):
+                # Execute nested blocks if any
+                iteration_result = {
+                    "iteration": i + 1,
+                    "input": input_value,
+                    "output": f"{input_value} (iteration {i + 1})"
+                }
+                results.append(iteration_result)
+        
+        elif loop_type == 'list':
+            input_list = inputs.get('input', [])
+            if isinstance(input_list, str):
+                input_list = input_list.split(',')
+            
+            for i, item in enumerate(input_list):
+                iteration_result = {
+                    "iteration": i + 1,
+                    "item": item.strip() if isinstance(item, str) else item,
+                    "index": i
+                }
+                results.append(iteration_result)
+        
+        elif loop_type == 'while':
+            condition = config.get('condition', 'false')
+            max_iterations = int(config.get('max_iterations', 100))
+            current_value = inputs.get('input', 0)
+            
+            iteration = 0
+            while iteration < max_iterations:
+                # Simple condition evaluation (can be expanded)
+                if condition == 'less_than_10' and float(current_value) >= 10:
+                    break
+                elif condition == 'not_empty' and not current_value:
+                    break
+                
+                iteration_result = {
+                    "iteration": iteration + 1,
+                    "value": current_value
+                }
+                results.append(iteration_result)
+                
+                iteration += 1
+                current_value = float(current_value) + 1 if isinstance(current_value, (int, float)) else current_value
+        
+        return {
+            "output": results,
+            "total_iterations": len(results)
+        }
+    
+    async def execute_http_block(self, block: Dict, inputs: Dict, context: WorkflowContext) -> Dict[str, Any]:
+        """Enhanced HTTP block with authentication and error handling"""
+        config = block.get('config', {})
+        method = config.get('method', 'GET').upper()
+        url = config.get('url', '')
+        headers = config.get('headers', {})
+        auth_type = config.get('auth_type', 'none')
+        timeout = int(config.get('timeout', 30))
+        
+        # Variable substitution in URL
+        for key, value in inputs.items():
+            url = url.replace(f'{{{key}}}', str(value))
+        
+        # Prepare request data
+        request_data = None
+        if method in ['POST', 'PUT', 'PATCH']:
+            request_data = config.get('body', {})
+            if isinstance(request_data, str):
+                # Variable substitution in body
+                for key, value in inputs.items():
+                    request_data = request_data.replace(f'{{{key}}}', str(value))
+            headers['Content-Type'] = headers.get('Content-Type', 'application/json')
+        
+        # Authentication
+        if auth_type == 'bearer':
+            token = config.get('bearer_token', '')
+            headers['Authorization'] = f'Bearer {token}'
+        elif auth_type == 'basic':
+            username = config.get('username', '')
+            password = config.get('password', '')
+            import base64
+            credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+            headers['Authorization'] = f'Basic {credentials}'
+        
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            try:
+                async with session.request(
+                    method, 
+                    url, 
+                    headers=headers, 
+                    json=request_data if isinstance(request_data, dict) else None,
+                    data=request_data if isinstance(request_data, str) else None
+                ) as response:
+                    response_text = await response.text()
+                    
+                    # Try to parse as JSON
+                    try:
+                        response_data = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        response_data = response_text
+                    
+                    return {
+                        "output": response_data,
+                        "status_code": response.status,
+                        "headers": dict(response.headers),
+                        "success": 200 <= response.status < 300
+                    }
+            except asyncio.TimeoutError:
+                raise Exception(f"HTTP request timed out after {timeout} seconds")
+            except Exception as e:
+                raise Exception(f"HTTP request failed: {str(e)}")
+    
+    async def execute_database_block(self, block: Dict, inputs: Dict, context: WorkflowContext) -> Dict[str, Any]:
+        """Enhanced database block with SQLite support"""
+        config = block.get('config', {})
+        operation = config.get('operation', 'query')
+        query = config.get('query', '')
+        
+        # Variable substitution in query
+        for key, value in inputs.items():
+            query = query.replace(f'{{{key}}}', str(value))
+        
+        # Use temporary SQLite database for demo
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_file:
+            db_path = tmp_file.name
+        
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            if operation == 'query':
+                cursor.execute(query)
+                results = cursor.fetchall()
+                columns = [description[0] for description in cursor.description] if cursor.description else []
+                
+                # Convert to list of dictionaries
+                result_data = []
+                for row in results:
+                    result_data.append(dict(zip(columns, row)))
+                
+                return {
+                    "output": result_data,
+                    "row_count": len(results),
+                    "columns": columns
+                }
+            
+            elif operation == 'execute':
+                cursor.execute(query)
+                conn.commit()
+                
+                return {
+                    "output": f"Query executed successfully. Rows affected: {cursor.rowcount}",
+                    "rows_affected": cursor.rowcount
+                }
+        
+        except Exception as e:
+            raise Exception(f"Database operation failed: {str(e)}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
+            try:
+                os.unlink(db_path)
+            except:
+                pass
+    
+    async def execute_math_block(self, block: Dict, inputs: Dict, context: WorkflowContext) -> Dict[str, Any]:
+        """Enhanced math block with advanced operations"""
+        config = block.get('config', {})
+        operation = config.get('operation', 'add')
+        
+        if operation in ['add', 'subtract', 'multiply', 'divide']:
+            value1 = float(inputs.get('input1', 0))
+            value2 = float(inputs.get('input2', 0))
+            
+            if operation == 'add':
+                result = value1 + value2
+            elif operation == 'subtract':
+                result = value1 - value2
+            elif operation == 'multiply':
+                result = value1 * value2
+            elif operation == 'divide':
+                result = value1 / value2 if value2 != 0 else float('inf')
+        
+        elif operation in ['sin', 'cos', 'tan', 'sqrt', 'log', 'exp']:
+            value = float(inputs.get('input', 0))
+            
+            if operation == 'sin':
+                result = math.sin(value)
+            elif operation == 'cos':
+                result = math.cos(value)
+            elif operation == 'tan':
+                result = math.tan(value)
+            elif operation == 'sqrt':
+                result = math.sqrt(abs(value))
+            elif operation == 'log':
+                result = math.log(value) if value > 0 else float('-inf')
+            elif operation == 'exp':
+                result = math.exp(value)
+        
+        elif operation == 'custom':
+            expression = config.get('expression', 'x')
+            value = float(inputs.get('input', 0))
+            
+            # Simple expression evaluation (replace with safer eval alternative in production)
+            safe_dict = {
+                'x': value,
+                'pi': math.pi,
+                'e': math.e,
+                'sin': math.sin,
+                'cos': math.cos,
+                'tan': math.tan,
+                'sqrt': math.sqrt,
+                'log': math.log,
+                'exp': math.exp,
+                'abs': abs,
+                'pow': pow
+            }
+            
+            try:
+                result = eval(expression, {"__builtins__": {}}, safe_dict)
+            except Exception as e:
+                raise Exception(f"Math expression evaluation failed: {str(e)}")
+        
+        else:
+            result = 0
+        
+        return {"output": result}
+    
+    def _build_conversation_prompt(self, history: List[Dict], current_prompt: str, system_prompt: str = "") -> str:
+        """Build a conversation prompt with history"""
+        prompt_parts = []
+        
+        if system_prompt:
+            prompt_parts.append(f"System: {system_prompt}")
+        
+        # Add last few conversation turns
+        for turn in history[-5:]:  # Keep last 5 turns
+            prompt_parts.append(f"User: {turn['user']}")
+            prompt_parts.append(f"Assistant: {turn['assistant']}")
+        
+        prompt_parts.append(f"User: {current_prompt}")
+        prompt_parts.append("Assistant:")
+        
+        return "\n".join(prompt_parts)
+
+# utils.py - Utility functions
+import hashlib
+import json
+from typing import Any, Dict
+
+def generate_workflow_hash(blocks: List[Dict], connections: List[Dict]) -> str:
+    """Generate a hash for workflow configuration"""
+    workflow_data = {
+        'blocks': sorted(blocks, key=lambda x: x.get('id', '')),
+        'connections': sorted(connections, key=lambda x: (x.get('from', ''), x.get('to', '')))
+    }
+    
+    workflow_json = json.dumps(workflow_data, sort_keys=True)
+    return hashlib.sha256(workflow_json.encode()).hexdigest()
+
+def validate_block_config(block_type: str, config: Dict[str, Any], block_types: Dict[str, Any]) -> List[str]:
+    """Validate block configuration against schema"""
+    errors = []
+    
+    if block_type not in block_types:
+        errors.append(f"Unknown block type: {block_type}")
+        return errors
+    
+    block_schema = block_types[block_type].get('config', {})
+    
+    for field_name, field_config in block_schema.items():
+        field_type = field_config.get('type')
+        required = field_config.get('required', False)
+        
+        if required and field_name not in config:
+            errors.append(f"Required field '{field_name}' is missing")
+            continue
+        
+        if field_name in config:
+            value = config[field_name]
+            
+            if field_type == 'number':
+                if not isinstance(value, (int, float)):
+                    errors.append(f"Field '{field_name}' must be a number")
+                else:
+                    min_val = field_config.get('min')
+                    max_val = field_config.get('max')
+                    if min_val is not None and value < min_val:
+                        errors.append(f"Field '{field_name}' must be >= {min_val}")
+                    if max_val is not None and value > max_val:
+                        errors.append(f"Field '{field_name}' must be <= {max_val}")
+            
+            elif field_type == 'select':
+                options = field_config.get('options', [])
+                if value not in options:
+                    errors.append(f"Field '{field_name}' must be one of: {options}")
+    
+    return errors
+
+# Start script
+if __name__ == "__main__":
+    # Example usage
+    engine = AdvancedWorkflowEngine()
+    executors = ExtendedBlockExecutors()
+    
+    # Register all executors
+    engine.register_executor('input', executors.execute_input_block)
+    engine.register_executor('llm', executors.execute_llm_block)
+    engine.register_executor('transform', executors.execute_transform_block)
+    engine.register_executor('conditional', executors.execute_conditional_block)
+    engine.register_executor('loop', executors.execute_loop_block)
+    engine.register_executor('http', executors.execute_http_block)
+    engine.register_executor('database', executors.execute_database_block)
+    engine.register_executor('math', executors.execute_math_block)
+    
+    print("Advanced Workflow Engine initialized with all executors!")
