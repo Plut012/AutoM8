@@ -1,0 +1,62 @@
+# requirements.txt
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+alembic==1.12.1
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+python-multipart==0.0.6
+aiohttp==3.9.1
+networkx==3.2.1
+pydantic==2.5.0
+python-dotenv==1.0.0
+
+# .env (environment variables)
+SECRET_KEY=your-super-secret-key-change-this-in-production
+DATABASE_URL=postgresql://user:password@localhost:5432/workflow_db
+OLLAMA_BASE_URL=http://localhost:11434
+ENVIRONMENT=development
+
+# alembic.ini (database migrations)
+[alembic]
+script_location = alembic
+prepend_sys_path = .
+version_path_separator = os
+sqlalchemy.url = postgresql://user:password@localhost:5432/workflow_db
+
+[post_write_hooks]
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
